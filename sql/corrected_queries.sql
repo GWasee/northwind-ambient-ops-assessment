@@ -1,46 +1,80 @@
 -- =====================================================================
---  Northwind Ambient Ops — Corrected Reporting Queries
---  Dialect: PostgreSQL 15. All *_utc columns are TIMESTAMP (no tz), UTC.
---  Every query can be copied and pasted directly into the Retool Query Library.
+-- Northwind Ambient Ops — Corrected Reporting Queries
+-- Dialect: PostgreSQL 15
+-- *_utc columns are TIMESTAMP WITHOUT TIME ZONE containing UTC instants.
+-- Each numbered query is standalone and can be pasted into Retool Query Library.
 -- =====================================================================
 
 
 -- ---------------------------------------------------------------------
 -- Q1  Audit pass rate
 --
--- Changes made vs PROVIDED_QUERIES.sql:
---   1. CDT Business Day Window: Replaced BETWEEN midnight UTC with
---      >= '2026-04-01 05:00:00' AND < '2026-07-01 05:00:00' (America/Chicago CDT).
---   2. Excluded Void Notes: Added AND NOT n.is_void.
---   3. Avoided Clinician SCD2 Fan-Out: Removed unneeded JOIN clinician
---      (which matched multiple historical records and multiplied rows for 4 clinicians).
---   4. Recomputed Scores: Recalculated composite_score from raw sub-scores and
---      rubric_weight, bypassing stale ETL precomputations (234 pass/fail mismatches).
---   5. Retool / Postgres Type Cast: Added explicit ::numeric cast inside ROUND()
---      to prevent "function round(real, integer) does not exist".
+-- Corrections vs PROVIDED_QUERIES.sql:
+--   1. Resolve note re-ingestions to one logical note using latest ingested_at_utc.
+--   2. Use the America/Chicago Q2 business-day UTC boundaries.
+--   3. Exclude void notes.
+--   4. Remove the unnecessary clinician SCD2 join that can fan out rows.
+--   5. Recompute composite score and pass/fail from raw audit dimensions using
+--      the weights and threshold for the audit's recorded rubric_version.
 -- ---------------------------------------------------------------------
-WITH recomputed_audit AS (
+WITH canonical_note AS (
+    SELECT *
+    FROM (
+        SELECT
+            n.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY n.note_id
+                ORDER BY n.ingested_at_utc DESC, n.ingestion_id DESC
+            ) AS rn
+        FROM note n
+    ) x
+    WHERE x.rn = 1
+),
+rubric AS (
+    SELECT
+        rubric_version,
+        MAX(pass_threshold) AS pass_threshold,
+        MAX(weight) FILTER (WHERE dimension = 'accuracy')     AS w_accuracy,
+        MAX(weight) FILTER (WHERE dimension = 'completeness') AS w_completeness,
+        MAX(weight) FILTER (WHERE dimension = 'formatting')   AS w_formatting,
+        MAX(weight) FILTER (WHERE dimension = 'terminology')  AS w_terminology,
+        MAX(weight) FILTER (WHERE dimension = 'hpi')          AS w_hpi,
+        MAX(weight) FILTER (WHERE dimension = 'ros')          AS w_ros,
+        MAX(weight) FILTER (WHERE dimension = 'plan')         AS w_plan
+    FROM rubric_weight
+    GROUP BY rubric_version
+),
+recomputed_audit AS (
     SELECT
         a.note_id,
-        (SELECT rw.pass_threshold FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version LIMIT 1) AS pass_threshold,
-        ROUND((
-            (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'accuracy')    * a.score_accuracy
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'completeness') * a.score_completeness
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'formatting')   * a.score_formatting
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'terminology')  * a.score_terminology
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'hpi')         * a.score_hpi
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'ros')         * a.score_ros
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'plan')        * a.score_plan
-        )::numeric, 4) AS recomp_composite
+        r.pass_threshold,
+        (
+            r.w_accuracy     * a.score_accuracy
+          + r.w_completeness * a.score_completeness
+          + r.w_formatting   * a.score_formatting
+          + r.w_terminology  * a.score_terminology
+          + r.w_hpi          * a.score_hpi
+          + r.w_ros          * a.score_ros
+          + r.w_plan         * a.score_plan
+        ) AS recomp_composite
     FROM note_audit a
+    JOIN rubric r
+      ON r.rubric_version = a.rubric_version
 )
 SELECT
-    COUNT(*)                                                          AS audited_notes,
-    ROUND((100.0 * SUM(CASE WHEN ra.recomp_composite >= ra.pass_threshold THEN 1 ELSE 0 END)
-          / COUNT(*))::numeric, 1)                                    AS pass_rate_pct,
-    ROUND(AVG(ra.recomp_composite)::numeric, 4)                       AS avg_composite
-FROM note n
-JOIN recomputed_audit ra ON ra.note_id = n.note_id
+    COUNT(*) AS audited_notes,
+    ROUND(
+        (
+            100.0 * COUNT(*) FILTER (
+                WHERE ra.recomp_composite >= ra.pass_threshold
+            ) / NULLIF(COUNT(*), 0)
+        )::numeric,
+        1
+    ) AS pass_rate_pct,
+    ROUND(AVG(ra.recomp_composite)::numeric, 4) AS avg_composite
+FROM canonical_note n
+JOIN recomputed_audit ra
+  ON ra.note_id = n.note_id
 WHERE n.submitted_at_utc >= TIMESTAMP '2026-04-01 05:00:00'
   AND n.submitted_at_utc <  TIMESTAMP '2026-07-01 05:00:00'
   AND NOT n.is_void;
@@ -49,132 +83,243 @@ WHERE n.submitted_at_utc >= TIMESTAMP '2026-04-01 05:00:00'
 -- ---------------------------------------------------------------------
 -- Q2  Delivery SLA breach rate
 --
--- Changes made vs PROVIDED_QUERIES.sql:
---   1. CDT Business Day Window: Replaced BETWEEN midnight UTC with
---      >= '2026-04-01 05:00:00' AND < '2026-07-01 05:00:00' (America/Chicago CDT).
---   2. Excluded Void & Undelivered: Added AND NOT n.is_void AND n.delivered_at_utc IS NOT NULL.
---   3. Effective-Dated SLA Join: Added join condition on s.effective_from and s.effective_to
---      to eliminate Cartesian row duplication (pre/post May 15 SLA config rows).
---   4. Removed Defective Escalation Filter: Removed LEFT JOIN escalation / WHERE e.status <> 'RESOLVED'
---      which inadvertently acted as an INNER JOIN, excluding 5,038 unescalated notes.
---   5. Retool / Postgres Type Cast: Added explicit ::numeric cast inside ROUND()
---      to prevent "function round(real, integer) does not exist".
+-- Corrections vs PROVIDED_QUERIES.sql:
+--   1. Resolve note re-ingestions to one logical note using latest ingested_at_utc.
+--   2. Use the America/Chicago Q2 business-day UTC boundaries.
+--   3. Exclude void and undelivered notes.
+--   4. Match the effective-dated SLA using the note's America/Chicago
+--      business date, not its UTC calendar date.
+--   5. Remove the escalation join/filter, which excluded notes with no escalation.
 -- ---------------------------------------------------------------------
+WITH canonical_note AS (
+    SELECT *
+    FROM (
+        SELECT
+            n.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY n.note_id
+                ORDER BY n.ingested_at_utc DESC, n.ingestion_id DESC
+            ) AS rn
+        FROM note n
+    ) x
+    WHERE x.rn = 1
+),
+eligible AS (
+    SELECT
+        n.*,
+        (n.submitted_at_utc - INTERVAL '5 hours')::date AS chicago_business_date
+    FROM canonical_note n
+    WHERE n.submitted_at_utc >= TIMESTAMP '2026-04-01 05:00:00'
+      AND n.submitted_at_utc <  TIMESTAMP '2026-07-01 05:00:00'
+      AND NOT n.is_void
+      AND n.delivered_at_utc IS NOT NULL
+)
 SELECT
-    COUNT(*)                                                          AS notes_measured,
-    ROUND((100.0 * SUM(CASE WHEN EXTRACT(EPOCH FROM (n.delivered_at_utc - n.submitted_at_utc))/60.0
-                                > s.target_minutes THEN 1 ELSE 0 END)
-          / COUNT(*))::numeric, 1)                                    AS breach_rate_pct,
-    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
-        ORDER BY EXTRACT(EPOCH FROM (n.delivered_at_utc - n.submitted_at_utc))/60.0
-    )::numeric, 1)                                                    AS median_minutes
-FROM note n
+    COUNT(*) AS notes_measured,
+    ROUND(
+        (
+            100.0 * COUNT(*) FILTER (
+                WHERE EXTRACT(EPOCH FROM (n.delivered_at_utc - n.submitted_at_utc)) / 60.0
+                      > s.target_minutes
+            ) / NULLIF(COUNT(*), 0)
+        )::numeric,
+        1
+    ) AS breach_rate_pct,
+    ROUND(
+        PERCENTILE_CONT(0.5) WITHIN GROUP (
+            ORDER BY EXTRACT(EPOCH FROM (n.delivered_at_utc - n.submitted_at_utc)) / 60.0
+        )::numeric,
+        1
+    ) AS median_minutes
+FROM eligible n
 JOIN sla_config s
-      ON s.product_line = n.product_line
-     AND s.priority     = n.priority
-     AND n.submitted_at_utc::date >= s.effective_from
-     AND (s.effective_to IS NULL OR n.submitted_at_utc::date <= s.effective_to)
-WHERE n.submitted_at_utc >= TIMESTAMP '2026-04-01 05:00:00'
-  AND n.submitted_at_utc <  TIMESTAMP '2026-07-01 05:00:00'
-  AND NOT n.is_void
-  AND n.delivered_at_utc IS NOT NULL;
+  ON s.product_line = n.product_line
+ AND s.priority = n.priority
+ AND n.chicago_business_date >= s.effective_from
+ AND (s.effective_to IS NULL OR n.chicago_business_date <= s.effective_to);
 
 
 -- ---------------------------------------------------------------------
 -- Q3  Daily volume + anomaly flag
 --
--- Changes made vs PROVIDED_QUERIES.sql:
---   1. Chicago Calendar Day: Converted UTC timestamp to Chicago local date
---      ((n.submitted_at_utc - INTERVAL '5 hours')::date) to align with business day.
---   2. Excluded Void Notes: Added AND NOT n.is_void.
---   3. Weekday Filter: Applied the 30% drop anomaly flag only to weekdays
---      (EXTRACT(DOW FROM submit_day)::int BETWEEN 1 AND 5) per the business rule,
---      preventing zero-volume weekends from being falsely flagged.
---   4. Retool / Postgres Type Cast: Added explicit ::numeric cast inside ROUND()
---      to prevent "function round(real, integer) does not exist".
+-- Business rule: flag any weekday more than 30% below the trailing
+-- 14-calendar-day average.
+--
+-- Corrections vs PROVIDED_QUERIES.sql:
+--   1. Resolve note re-ingestions to one logical note using latest ingested_at_utc.
+--   2. Convert UTC timestamps to the America/Chicago business date.
+--   3. Exclude void notes.
+--   4. Generate all 91 Q2 calendar dates so zero-volume days are retained.
+--   5. Apply the anomaly flag only to weekdays while keeping all calendar days
+--      in the 14-day trailing baseline.
 -- ---------------------------------------------------------------------
-WITH daily AS (
+WITH canonical_note AS (
+    SELECT *
+    FROM (
+        SELECT
+            n.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY n.note_id
+                ORDER BY n.ingested_at_utc DESC, n.ingestion_id DESC
+            ) AS rn
+        FROM note n
+    ) x
+    WHERE x.rn = 1
+),
+calendar AS (
+    SELECT gs::date AS submit_day
+    FROM generate_series(
+        TIMESTAMP '2026-04-01 00:00:00',
+        TIMESTAMP '2026-06-30 00:00:00',
+        INTERVAL '1 day'
+    ) AS gs
+),
+daily_counts AS (
     SELECT
-        (n.submitted_at_utc - INTERVAL '5 hours')::date               AS submit_day,
-        COUNT(*)                                                      AS notes
-    FROM note n
-    WHERE (n.submitted_at_utc - INTERVAL '5 hours')::date BETWEEN DATE '2026-04-01' AND DATE '2026-06-30'
+        (n.submitted_at_utc - INTERVAL '5 hours')::date AS submit_day,
+        COUNT(*) AS notes
+    FROM canonical_note n
+    WHERE n.submitted_at_utc >= TIMESTAMP '2026-04-01 05:00:00'
+      AND n.submitted_at_utc <  TIMESTAMP '2026-07-01 05:00:00'
       AND NOT n.is_void
     GROUP BY 1
+),
+daily AS (
+    SELECT
+        c.submit_day,
+        COALESCE(d.notes, 0) AS notes
+    FROM calendar c
+    LEFT JOIN daily_counts d
+      ON d.submit_day = c.submit_day
+),
+scored AS (
+    SELECT
+        submit_day,
+        notes,
+        AVG(notes) OVER (
+            ORDER BY submit_day
+            ROWS BETWEEN 14 PRECEDING AND 1 PRECEDING
+        ) AS trailing_avg
+    FROM daily
 )
 SELECT
     submit_day,
     notes,
-    ROUND(AVG(notes) OVER (ORDER BY submit_day ROWS BETWEEN 14 PRECEDING AND 1 PRECEDING)::numeric, 1) AS trailing_avg,
-    CASE WHEN EXTRACT(DOW FROM submit_day)::int BETWEEN 1 AND 5
-          AND notes < 0.70 * AVG(notes) OVER (ORDER BY submit_day ROWS BETWEEN 14 PRECEDING AND 1 PRECEDING)
-         THEN 'ANOMALY' END                                           AS flag
-FROM daily
+    ROUND(trailing_avg::numeric, 1) AS trailing_avg,
+    CASE
+        WHEN EXTRACT(DOW FROM submit_day)::int BETWEEN 1 AND 5
+         AND trailing_avg IS NOT NULL
+         AND notes < 0.70 * trailing_avg
+        THEN 'ANOMALY'
+    END AS flag
+FROM scored
 ORDER BY submit_day;
 
 
 -- ---------------------------------------------------------------------
 -- Q4  MDS leaderboard
 --
--- Changes made vs PROVIDED_QUERIES.sql:
---   1. Stable Grouping Key: Grouped by m.mds_id, m.mds_name, m.status because mds_name
---      is non-unique ("Domingo, Rafael" exists under two distinct IDs: MD-206 and MD-227).
---   2. CDT Business Day Window: Filtered submitted_at_utc >= '2026-04-01 05:00:00'
---      AND < '2026-07-01 05:00:00' (America/Chicago CDT).
---   3. Excluded Void Notes: Added AND NOT n.is_void.
---   4. NULL-Aware Word Count: Used AVG(n.word_count) without COALESCE(..., 0) because
---      NULL represents missing audio transcript, not a zero-word note.
---   5. Recomputed Scores: Recomputed composite_score from raw rubric sub-scores and weights.
---   6. Retool / Postgres Type Cast: Added explicit ::numeric cast inside ROUND()
---      to prevent "function round(real, integer) does not exist".
+-- Corrections vs PROVIDED_QUERIES.sql:
+--   1. Resolve note re-ingestions to one logical note using latest ingested_at_utc.
+--   2. Group by stable mds_id as well as display name because mds_name is not unique.
+--   3. Use the America/Chicago Q2 business-day UTC boundaries.
+--   4. Exclude void notes.
+--   5. Preserve NULL word_count instead of converting missing transcripts to zero.
+--   6. Recompute audit composite scores from the raw dimensions and rubric weights.
+--   7. Rank by the unrounded average composite; round only the displayed value.
 -- ---------------------------------------------------------------------
-WITH recomputed_audit AS (
+WITH canonical_note AS (
+    SELECT *
+    FROM (
+        SELECT
+            n.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY n.note_id
+                ORDER BY n.ingested_at_utc DESC, n.ingestion_id DESC
+            ) AS rn
+        FROM note n
+    ) x
+    WHERE x.rn = 1
+),
+rubric AS (
+    SELECT
+        rubric_version,
+        MAX(weight) FILTER (WHERE dimension = 'accuracy')     AS w_accuracy,
+        MAX(weight) FILTER (WHERE dimension = 'completeness') AS w_completeness,
+        MAX(weight) FILTER (WHERE dimension = 'formatting')   AS w_formatting,
+        MAX(weight) FILTER (WHERE dimension = 'terminology')  AS w_terminology,
+        MAX(weight) FILTER (WHERE dimension = 'hpi')          AS w_hpi,
+        MAX(weight) FILTER (WHERE dimension = 'ros')          AS w_ros,
+        MAX(weight) FILTER (WHERE dimension = 'plan')         AS w_plan
+    FROM rubric_weight
+    GROUP BY rubric_version
+),
+recomputed_audit AS (
     SELECT
         a.note_id,
-        ROUND((
-            (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'accuracy')    * a.score_accuracy
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'completeness') * a.score_completeness
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'formatting')   * a.score_formatting
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'terminology')  * a.score_terminology
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'hpi')         * a.score_hpi
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'ros')         * a.score_ros
-          + (SELECT rw.weight FROM rubric_weight rw WHERE rw.rubric_version = a.rubric_version AND rw.dimension = 'plan')        * a.score_plan
-        )::numeric, 4) AS recomp_composite
+        (
+            r.w_accuracy     * a.score_accuracy
+          + r.w_completeness * a.score_completeness
+          + r.w_formatting   * a.score_formatting
+          + r.w_terminology  * a.score_terminology
+          + r.w_hpi          * a.score_hpi
+          + r.w_ros          * a.score_ros
+          + r.w_plan         * a.score_plan
+        ) AS recomp_composite
     FROM note_audit a
+    JOIN rubric r
+      ON r.rubric_version = a.rubric_version
+),
+leaderboard AS (
+    SELECT
+        m.mds_id,
+        m.mds_name,
+        m.status,
+        COUNT(*) AS notes_handled,
+        AVG(n.word_count) AS avg_word_count_raw,
+        AVG(ra.recomp_composite) AS avg_composite_raw,
+        SUM(CASE WHEN n.word_count < 50 THEN 1 ELSE 0 END) AS short_note_flags
+    FROM canonical_note n
+    JOIN mds m
+      ON m.mds_id = n.mds_id
+    LEFT JOIN recomputed_audit ra
+      ON ra.note_id = n.note_id
+    WHERE n.submitted_at_utc >= TIMESTAMP '2026-04-01 05:00:00'
+      AND n.submitted_at_utc <  TIMESTAMP '2026-07-01 05:00:00'
+      AND NOT n.is_void
+    GROUP BY m.mds_id, m.mds_name, m.status
 )
 SELECT
-    m.mds_id,
-    m.mds_name,
-    m.status,
-    COUNT(*)                                                          AS notes_handled,
-    ROUND(AVG(n.word_count)::numeric, 1)                              AS avg_word_count,
-    ROUND(AVG(ra.recomp_composite)::numeric, 4)                       AS avg_composite,
-    SUM(CASE WHEN n.word_count < 50 THEN 1 ELSE 0 END)                AS short_note_flags
-FROM note n
-JOIN mds m ON m.mds_id = n.mds_id
-LEFT JOIN recomputed_audit ra ON ra.note_id = n.note_id
-WHERE n.submitted_at_utc >= TIMESTAMP '2026-04-01 05:00:00'
-  AND n.submitted_at_utc <  TIMESTAMP '2026-07-01 05:00:00'
-  AND NOT n.is_void
-GROUP BY m.mds_id, m.mds_name, m.status
-ORDER BY avg_composite DESC NULLS LAST, notes_handled DESC;
+    mds_id,
+    mds_name,
+    status,
+    notes_handled,
+    ROUND(avg_word_count_raw::numeric, 1) AS avg_word_count,
+    ROUND(avg_composite_raw::numeric, 4) AS avg_composite,
+    short_note_flags
+FROM leaderboard
+ORDER BY avg_composite_raw DESC NULLS LAST,
+         notes_handled DESC,
+         mds_id;
 
 
 -- ---------------------------------------------------------------------
 -- Q5  Escalation health
 --
--- Changes made vs PROVIDED_QUERIES.sql:
---   1. CDT Business Day Window: Filtered created_at_utc >= '2026-04-01 05:00:00'
---      AND < '2026-07-01 05:00:00' (America/Chicago CDT).
---   2. Isolated Active Escalations: Filtered status = 'OPEN' instead of status <> 'RESOLVED'
---      to exclude 43 PENDING_POST queue items that were never delivered to Slack or assigned.
---   3. Retool / Postgres Type Cast: Maintained explicit ::numeric cast inside ROUND().
+-- Corrections vs PROVIDED_QUERIES.sql:
+--   1. Use the America/Chicago Q2 business-day UTC boundaries.
+--   2. Count status = 'OPEN' only. PENDING_POST is a posting/workflow state:
+--      the database row exists but the Slack post has not completed.
 -- ---------------------------------------------------------------------
 SELECT
-    COUNT(*)                                                          AS open_escalations,
-    ROUND(AVG(EXTRACT(EPOCH FROM (e.first_response_at_utc - e.created_at_utc))/60.0)::numeric, 1)
-                                                                      AS avg_minutes_to_first_response,
-    MIN(e.created_at_utc)                                             AS oldest_open
+    COUNT(*) AS open_escalations,
+    ROUND(
+        AVG(
+            EXTRACT(EPOCH FROM (e.first_response_at_utc - e.created_at_utc)) / 60.0
+        )::numeric,
+        1
+    ) AS avg_minutes_to_first_response,
+    MIN(e.created_at_utc) AS oldest_open
 FROM escalation e
 WHERE e.status = 'OPEN'
   AND e.created_at_utc >= TIMESTAMP '2026-04-01 05:00:00'
